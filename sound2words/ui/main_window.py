@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
 import os
+import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -32,7 +34,13 @@ try:
     from sound2words.core.autosave import AutoSaveManager
     from sound2words.core.exporter import TranscriptExporter
     from sound2words.core.models import SessionSnapshot, TranscriptSegment
+    from sound2words.core.process_loopback import (
+        AudioSourceSelection,
+        ProcessLoopback,
+        build_audio_source_options,
+    )
     from sound2words.core.transcriber import RealtimeTranscriber
+    from sound2words.ui.audio_source_picker import AudioSourcePickerDialog
 except ModuleNotFoundError:
     project_root = Path(__file__).resolve().parents[2]
     if str(project_root) not in sys.path:
@@ -41,7 +49,13 @@ except ModuleNotFoundError:
     from sound2words.core.autosave import AutoSaveManager
     from sound2words.core.exporter import TranscriptExporter
     from sound2words.core.models import SessionSnapshot, TranscriptSegment
+    from sound2words.core.process_loopback import (
+        AudioSourceSelection,
+        ProcessLoopback,
+        build_audio_source_options,
+    )
     from sound2words.core.transcriber import RealtimeTranscriber
+    from sound2words.ui.audio_source_picker import AudioSourcePickerDialog
 
 
 class MainWindow(QMainWindow):
@@ -51,7 +65,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"Sound2Words {__version__}")
-        self.resize(1040, 700)
+        self.resize(1080, 730)
 
         root = Path(__file__).resolve().parents[2]
         self.autosave = AutoSaveManager(root)
@@ -61,6 +75,8 @@ class MainWindow(QMainWindow):
         self.worker: RealtimeTranscriber | None = None
         self.selected_file_path = ""
         self.selected_device_name = ""
+        self.selected_audio_source = AudioSourceSelection(mode="all", pid=None, label="全部音源")
+        self.audio_source_options = []
         self.history_records: list[tuple[Path, SessionSnapshot]] = []
 
         self._build_ui()
@@ -114,6 +130,32 @@ class MainWindow(QMainWindow):
         source_row.addWidget(self.file_label)
         source_row.addStretch()
         layout.addLayout(source_row)
+
+        system_row = QHBoxLayout()
+        system_row.addWidget(QLabel("系统输入-目标音源:"))
+        self.audio_source_label = QLabel("全部音源")
+        self.audio_source_label.setMinimumWidth(280)
+        system_row.addWidget(self.audio_source_label, 1)
+
+        self.pick_audio_source_button = QPushButton("选择音源")
+        self.pick_audio_source_button.clicked.connect(self._pick_audio_source)
+        system_row.addWidget(self.pick_audio_source_button)
+
+        self.refresh_client_button = QPushButton("刷新音源")
+        self.refresh_client_button.clicked.connect(self._reload_client_list)
+        system_row.addWidget(self.refresh_client_button)
+
+        self.open_mixer_button = QPushButton("打开应用音量设置")
+        self.open_mixer_button.clicked.connect(self._open_apps_volume_settings)
+        system_row.addWidget(self.open_mixer_button)
+        system_row.addStretch()
+        layout.addLayout(system_row)
+
+        self.system_hint_label = QLabel(
+            "提示: 默认采集全部系统声音；也可选择单个应用并在同名分组内继续选具体 PID。"
+        )
+        self.system_hint_label.setWordWrap(True)
+        layout.addWidget(self.system_hint_label)
 
         model_row = QHBoxLayout()
         model_row.addWidget(QLabel("模型加载:"))
@@ -233,25 +275,49 @@ class MainWindow(QMainWindow):
         index = self.source_combo.findData(snapshot.source_type)
         if index >= 0:
             self.source_combo.setCurrentIndex(index)
-
         self.selected_file_path = snapshot.file_path
         self.file_label.setText(Path(snapshot.file_path).name if snapshot.file_path else "未选择文件")
-        self.selected_device_name = snapshot.source_name
+        if snapshot.source_type != "system":
+            self.selected_device_name = snapshot.source_name
+        if snapshot.source_type == "system":
+            pid = None
+            matched = re.search(r"\(PID\s+(\d+)\)", snapshot.source_name)
+            if matched:
+                pid = int(matched.group(1))
+            if pid and pid > 0:
+                self.selected_audio_source = AudioSourceSelection(
+                    mode="pid",
+                    pid=pid,
+                    label=snapshot.source_name,
+                    metadata={"restored": True},
+                )
+            else:
+                self.selected_audio_source = AudioSourceSelection(mode="all", pid=None, label="全部音源")
+            self.audio_source_label.setText(self.selected_audio_source.label)
 
     def _on_source_changed(self) -> None:
         source_type = self.source_combo.currentData()
         is_file_mode = source_type == "file"
+        is_system_mode = source_type == "system"
+
         self.choose_file_button.setVisible(is_file_mode)
         self.file_label.setVisible(is_file_mode)
 
         self.device_combo.setVisible(not is_file_mode)
         self.refresh_device_button.setVisible(not is_file_mode)
 
+        self.audio_source_label.setVisible(is_system_mode)
+        self.pick_audio_source_button.setVisible(is_system_mode)
+        self.refresh_client_button.setVisible(is_system_mode)
+        self.open_mixer_button.setVisible(is_system_mode)
+        self.system_hint_label.setVisible(is_system_mode)
+
         self.level_bar.setEnabled(not is_file_mode)
         self.level_bar.setValue(0)
         self.level_text.setText("0%")
 
         self._reload_device_list()
+        self._reload_client_list()
 
     def _reload_device_list(self) -> None:
         source_type = self.source_combo.currentData()
@@ -276,9 +342,47 @@ class MainWindow(QMainWindow):
 
         self.selected_device_name = self.device_combo.currentData() or ""
 
+    def _reload_client_list(self) -> None:
+        source_type = self.source_combo.currentData()
+        if source_type != "system":
+            self.selected_audio_source = AudioSourceSelection(mode="all", pid=None, label="全部音源")
+            self.audio_source_label.setText(self.selected_audio_source.label)
+            self.audio_source_options = []
+            return
+
+        raw = ProcessLoopback.list_audio_processes()
+        self.audio_source_options = build_audio_source_options(raw)
+
+        if self.selected_audio_source.mode == "pid" and self.selected_audio_source.pid:
+            alive = any(self.selected_audio_source.pid in option.pid_list for option in self.audio_source_options)
+            if not alive:
+                self.selected_audio_source = AudioSourceSelection(mode="all", pid=None, label="全部音源")
+        self.audio_source_label.setText(self.selected_audio_source.label)
+
+    def _open_apps_volume_settings(self) -> None:
+        try:
+            os.startfile("ms-settings:apps-volume")
+        except Exception:
+            subprocess.Popen(["start", "ms-settings:apps-volume"], shell=True)
+
     def _on_device_changed(self) -> None:
         data = self.device_combo.currentData()
         self.selected_device_name = data or ""
+
+    def _pick_audio_source(self) -> None:
+        if self.source_combo.currentData() != "system":
+            return
+        self._reload_client_list()
+        dialog = AudioSourcePickerDialog(
+            options=self.audio_source_options,
+            current_selection=self.selected_audio_source,
+            parent=self,
+        )
+        picked = dialog.pick()
+        if picked is None:
+            return
+        self.selected_audio_source = picked
+        self.audio_source_label.setText(picked.label)
 
     def _choose_file(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(
@@ -306,9 +410,28 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "缺少设备", "请先选择输入设备。")
             return
 
+        target_pid = 0
+        target_process_name = ""
+        target_label = ""
+        if source_type == "system" and self.selected_audio_source.mode == "pid" and self.selected_audio_source.pid:
+            target_pid = self.selected_audio_source.pid
+            self.status_label.setText(f"状态: 启用 PID 直采 ({target_pid})")
+            target_label = self.selected_audio_source.label
+            process_meta = self.selected_audio_source.metadata.get("process_meta")
+            if isinstance(process_meta, dict):
+                target_process_name = str(process_meta.get("process_name") or "").strip()
+            elif isinstance(process_meta, list) and process_meta:
+                first = process_meta[0] if isinstance(process_meta[0], dict) else {}
+                target_process_name = str(first.get("process_name") or "").strip()
+        elif source_type == "system":
+            self.status_label.setText("状态: 系统全量采集")
+
         if not reuse_existing or self.snapshot is None:
             now = datetime.now().isoformat()
             source_name = self.source_combo.currentText() if source_type == "file" else self.selected_device_name
+            if source_type == "system":
+                source_name = self.selected_audio_source.label
+
             self.snapshot = SessionSnapshot(
                 session_id=str(uuid4()),
                 started_at=now,
@@ -326,6 +449,9 @@ class MainWindow(QMainWindow):
             source_type=source_type,
             file_path=self.selected_file_path if source_type == "file" else "",
             device_name=self.selected_device_name,
+            target_pid=target_pid if source_type == "system" else 0,
+            target_process_name=target_process_name if source_type == "system" else "",
+            target_label=target_label if source_type == "system" else "",
             model_download_root=self.model_root,
         )
         self.worker.segment_ready.connect(self._handle_segment)
@@ -344,7 +470,10 @@ class MainWindow(QMainWindow):
         if self.snapshot is None:
             return
 
-        self._stop_worker()
+        stopped = self._stop_worker(wait_ms=15000)
+        if not stopped:
+            QMessageBox.warning(self, "结束失败", "识别线程仍在退出中，请稍后再试。")
+            return
         self._set_running(False)
         self.status_label.setText("状态: 已结束")
         archive_file = self.autosave.archive_and_clear(self.snapshot)
@@ -352,13 +481,16 @@ class MainWindow(QMainWindow):
         self._refresh_history_list()
         QMessageBox.information(self, "会话已保存", f"已归档到: {archive_file}")
 
-    def _stop_worker(self) -> None:
+    def _stop_worker(self, wait_ms: int = 8000) -> bool:
         if self.worker is None:
-            return
+            return True
 
         self.worker.stop()
-        self.worker.wait(4000)
+        finished = self.worker.wait(wait_ms)
+        if not finished:
+            return False
         self.worker = None
+        return True
 
     def _set_running(self, running: bool) -> None:
         self.start_button.setEnabled(not running)
@@ -366,6 +498,10 @@ class MainWindow(QMainWindow):
         self.source_combo.setEnabled(not running)
         self.device_combo.setEnabled(not running)
         self.refresh_device_button.setEnabled(not running)
+        self.pick_audio_source_button.setEnabled(not running)
+        self.audio_source_label.setEnabled(not running)
+        self.refresh_client_button.setEnabled(not running)
+        self.open_mixer_button.setEnabled(not running)
         self.choose_file_button.setEnabled(not running)
 
         if running:
@@ -380,17 +516,23 @@ class MainWindow(QMainWindow):
     def _set_export_enabled(self, enabled: bool) -> None:
         self.export_txt_button.setEnabled(enabled)
         self.export_srt_button.setEnabled(enabled)
-        docx_enabled = enabled and self.snapshot is not None and self.snapshot.source_type == "file"
-        self.export_docx_button.setEnabled(docx_enabled)
+        self.export_docx_button.setEnabled(enabled)
 
     def _handle_segment(self, segment: TranscriptSegment) -> None:
         if self.snapshot is None:
             return
 
-        self.snapshot.segments.append(segment)
-        self.transcript_view.append(
-            f"[{self._ms_to_hhmmss(segment.start_ms)}-{self._ms_to_hhmmss(segment.end_ms)}] {segment.text}"
-        )
+        if not self.snapshot.segments:
+            self.snapshot.segments.append(segment)
+        else:
+            merged = self.snapshot.segments[0]
+            merged.text = self._join_text(merged.text, segment.text)
+            merged.end_ms = max(merged.end_ms, segment.end_ms)
+            merged.confidence = round((merged.confidence + segment.confidence) / 2.0, 2)
+            self.snapshot.segments[0] = merged
+        self.transcript_view.setPlainText(self.snapshot.segments[0].text)
+        scroll = self.transcript_view.verticalScrollBar()
+        scroll.setValue(scroll.maximum())
         self._set_export_enabled(True)
 
     def _update_level(self, level: int) -> None:
@@ -445,11 +587,8 @@ class MainWindow(QMainWindow):
         if self.snapshot is None:
             return
 
-        self.transcript_view.clear()
-        for segment in self.snapshot.segments:
-            self.transcript_view.append(
-                f"[{self._ms_to_hhmmss(segment.start_ms)}-{self._ms_to_hhmmss(segment.end_ms)}] {segment.text}"
-            )
+        merged_text = self._merged_text(self.snapshot)
+        self.transcript_view.setPlainText(merged_text)
         self._set_export_enabled(len(self.snapshot.segments) > 0)
 
     def _refresh_history_list(self) -> None:
@@ -497,11 +636,26 @@ class MainWindow(QMainWindow):
             "",
             "转写内容:",
         ]
-        for segment in snapshot.segments:
-            lines.append(
-                f"[{self._ms_to_hhmmss(segment.start_ms)}-{self._ms_to_hhmmss(segment.end_ms)}] {segment.text}"
-            )
+        lines.append(self._merged_text(snapshot))
         self.history_detail.setPlainText("\n".join(lines))
+
+    @staticmethod
+    def _join_text(current: str, incoming: str) -> str:
+        current = (current or "").strip()
+        incoming = (incoming or "").strip()
+        if not current:
+            return incoming
+        if not incoming:
+            return current
+        if current.endswith((" ", "，", "。", "！", "？", ",", ".", "!", "?")):
+            return f"{current}{incoming}".strip()
+        return f"{current} {incoming}".strip()
+
+    def _merged_text(self, snapshot: SessionSnapshot) -> str:
+        text = ""
+        for segment in snapshot.segments:
+            text = self._join_text(text, segment.text)
+        return text
 
     def _delete_selected_history(self) -> None:
         row = self.history_list.currentRow()
@@ -531,10 +685,6 @@ class MainWindow(QMainWindow):
     def _export(self, fmt: str) -> None:
         if self.snapshot is None or not self.snapshot.segments:
             QMessageBox.information(self, "无可导出内容", "当前没有可导出的转写文本。")
-            return
-
-        if fmt == "docx" and self.snapshot.source_type != "file":
-            QMessageBox.information(self, "导出限制", "Word 导出仅在文件模式可用。")
             return
 
         try:
@@ -568,7 +718,14 @@ class MainWindow(QMainWindow):
             if answer == QMessageBox.StandardButton.No:
                 event.ignore()
                 return
-            self.stop_session()
+            stopped = self._stop_worker(wait_ms=20000)
+            if not stopped:
+                QMessageBox.warning(self, "无法退出", "识别线程尚未停止，请稍后再关闭窗口。")
+                event.ignore()
+                return
+            self._set_running(False)
+            if self.snapshot is not None:
+                self.autosave.archive_and_clear(self.snapshot)
 
         event.accept()
 

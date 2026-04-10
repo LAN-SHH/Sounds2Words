@@ -1,0 +1,24 @@
+﻿# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual env
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Runtime data
+data/exports/
+data/debug_segments/
+
+# Local model cache and temp artifacts
+data/models/
+.tmp_pac/
+
+# OS files
+.DS_Store
+Thumbs.db

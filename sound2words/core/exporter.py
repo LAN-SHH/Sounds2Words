@@ -3,8 +3,6 @@
 from datetime import datetime
 from pathlib import Path
 
-from docx import Document
-
 from sound2words.core.models import SessionSnapshot
 
 
@@ -36,6 +34,13 @@ class TranscriptExporter:
         return path
 
     def export_docx(self, snapshot: SessionSnapshot) -> Path:
+        try:
+            from docx import Document
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "未安装 python-docx，无法导出 Word。请在当前解释器执行: python -m pip install python-docx"
+            ) from exc
+
         path = self._build_path("docx")
         doc = Document()
         doc.add_heading("语音转写结果", level=1)
